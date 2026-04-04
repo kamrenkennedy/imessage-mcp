@@ -26,7 +26,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` and add:
   "mcpServers": {
     "imessage": {
       "command": "npx",
-      "args": ["-y", "@kamstudios/imessage-mcp"]
+      "args": ["-y", "@kamk95/imessage-mcp"]
     }
   }
 }

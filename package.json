@@ -1,5 +1,5 @@
 {
-  "name": "@kamstudios/imessage-mcp",
+  "name": "@kamk95/imessage-mcp",
   "version": "1.0.0",
   "description": "MCP server for reading and sending iMessages on macOS",
   "type": "module",
