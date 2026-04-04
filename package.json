@@ -1,0 +1,29 @@
+{
+  "name": "@kamstudios/imessage-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for reading and sending iMessages on macOS",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "imessage-mcp": "index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": ["darwin"],
+  "keywords": ["mcp", "imessage", "messages", "claude", "applescript"],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}
