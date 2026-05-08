@@ -40,6 +40,46 @@ function querySqlite(sql) {
   return querySqliteDb(DB_PATH, sql);
 }
 
+// iOS 16+ stores message text in `attributedBody` (typedstream-encoded NSAttributedString)
+// while leaving the plain `text` column NULL. This extracts the readable text from that blob.
+// Format ref: streamtyped header → class metadata → NSString block. After NSString, the inline
+// string payload starts at the 0x2b ("+") tag. Length is variable-width per typedstream:
+//   value < 0x80              → length is the byte itself (direct, 0..127)
+//   0x81 + u8                 → 128..255
+//   0x82 + u16le              → 256..65535
+//   0x83 + u24le              → 65536..16M
+function decodeAttributedBody(hex) {
+  if (!hex) return "";
+  try {
+    const buf = Buffer.from(hex, "hex");
+    const nss = buf.indexOf("NSString");
+    if (nss < 0) return "";
+    // Skip class metadata until the '+' tag marking the inline string payload.
+    let i = nss + "NSString".length;
+    while (i < buf.length && buf[i] !== 0x2b) i++;
+    if (i >= buf.length) return "";
+    i++;
+    let len;
+    const b = buf[i++];
+    if (b === 0x81) {
+      if (i >= buf.length) return "";
+      len = buf[i]; i += 1;
+    } else if (b === 0x82) {
+      if (i + 1 >= buf.length) return "";
+      len = buf.readUInt16LE(i); i += 2;
+    } else if (b === 0x83) {
+      if (i + 2 >= buf.length) return "";
+      len = buf.readUIntLE(i, 3); i += 3;
+    } else {
+      len = b;
+    }
+    if (len <= 0 || i + len > buf.length) return "";
+    return buf.toString("utf8", i, i + len);
+  } catch {
+    return "";
+  }
+}
+
 function runAppleScript(script) {
   const result = spawnSync("osascript", ["-"], {
     input: script,
@@ -231,6 +271,7 @@ function getConversations({ limit = 20 } = {}) {
       c.chat_identifier,
       c.style,
       m.text as last_message,
+      hex(m.attributedBody) as last_attributed_body_hex,
       m.is_from_me,
       m.date as last_date,
       m.cache_has_attachments as has_attachments,
@@ -250,13 +291,14 @@ function getConversations({ limit = 20 } = {}) {
   return rows.map(r => {
     const isGroup = r.style === 43;
     const resolvedName = r.display_name || resolveIdentifier(r.chat_identifier) || r.chat_identifier;
+    const decodedLast = r.last_message || decodeAttributedBody(r.last_attributed_body_hex);
     const result = {
       chat_id: r.chat_id,
       chat_guid: r.chat_guid,
       name: resolvedName,
       identifier: r.chat_identifier,
       is_group: isGroup,
-      last_message: r.last_message || (r.has_attachments ? "(attachment)" : "(no text)"),
+      last_message: decodedLast || (r.has_attachments ? "(attachment)" : "(no text)"),
       from_me: r.is_from_me === 1,
       time: appleTimeToDate(r.last_date),
     };
@@ -288,6 +330,7 @@ function getMessages({ contact, limit = 50 } = {}) {
     SELECT
       m.ROWID as message_rowid,
       m.text,
+      hex(m.attributedBody) as attributed_body_hex,
       m.is_from_me,
       m.date,
       m.cache_has_attachments,
@@ -302,7 +345,7 @@ function getMessages({ contact, limit = 50 } = {}) {
     JOIN chat c ON c.ROWID = cmj.chat_id
     LEFT JOIN handle h ON h.ROWID = m.handle_id
     WHERE (${whereParts.join(" OR ")})
-    AND (m.text IS NOT NULL OR m.cache_has_attachments = 1)
+    AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL OR m.cache_has_attachments = 1)
     ORDER BY m.date DESC
     LIMIT ${Number(limit)}
   `);
@@ -334,7 +377,7 @@ function getMessages({ contact, limit = 50 } = {}) {
   const messages = rows.reverse().map(r => {
     const msg = {
       from: r.is_from_me === 1 ? "Me" : resolveIdentifier(r.handle_id),
-      text: r.text || "",
+      text: r.text || decodeAttributedBody(r.attributed_body_hex) || "",
       time: appleTimeToDate(r.date),
     };
     if (r.cache_has_attachments) {
@@ -351,10 +394,17 @@ function getMessages({ contact, limit = 50 } = {}) {
 
 function searchMessages({ query, limit = 30 } = {}) {
   const safe = query.replace(/'/g, "''");
+  // Encode query as UTF-8 bytes → uppercase hex to match SQLite's hex(attributedBody) output.
+  // This is a coarse pre-filter — the JS post-filter below verifies the decoded text actually contains the query.
+  const queryHex = Buffer.from(query, "utf8").toString("hex").toUpperCase();
+  const queryLower = query.toLowerCase();
+  // Fetch a wider pool than `limit` so the post-filter has room after dropping false positives.
+  const sqlLimit = Math.max(Number(limit) * 4, 100);
   const rows = querySqlite(`
     SELECT
       m.ROWID as message_rowid,
       m.text,
+      hex(m.attributedBody) as attributed_body_hex,
       m.is_from_me,
       m.date,
       m.cache_has_attachments,
@@ -367,24 +417,30 @@ function searchMessages({ query, limit = 30 } = {}) {
     JOIN chat c ON c.ROWID = cmj.chat_id
     LEFT JOIN handle h ON h.ROWID = m.handle_id
     WHERE m.text LIKE '%${safe}%'
+       OR (m.text IS NULL AND m.attributedBody IS NOT NULL AND hex(m.attributedBody) LIKE '%${queryHex}%')
     ORDER BY m.date DESC
-    LIMIT ${Number(limit)}
+    LIMIT ${sqlLimit}
   `);
 
-  return rows.map(r => {
+  const matched = [];
+  for (const r of rows) {
+    const text = r.text || decodeAttributedBody(r.attributed_body_hex) || "";
+    if (!text.toLowerCase().includes(queryLower)) continue;
     const msg = {
       conversation: r.display_name || resolveIdentifier(r.chat_identifier) || r.chat_identifier,
       chat_guid: r.chat_guid,
       from: r.is_from_me === 1 ? "Me" : resolveIdentifier(r.handle_id),
-      text: r.text,
+      text,
       time: appleTimeToDate(r.date),
     };
     if (r.cache_has_attachments) {
       const atts = getAttachmentsForMessage(r.message_rowid);
       if (atts.length > 0) msg.attachments = atts;
     }
-    return msg;
-  });
+    matched.push(msg);
+    if (matched.length >= Number(limit)) break;
+  }
+  return matched;
 }
 
 function sendMessage({ recipient, message, files } = {}) {
