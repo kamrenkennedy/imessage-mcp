@@ -42,33 +42,39 @@ function querySqlite(sql) {
 
 // iOS 16+ stores message text in `attributedBody` (typedstream-encoded NSAttributedString)
 // while leaving the plain `text` column NULL. This extracts the readable text from that blob.
-// Format ref: streamtyped header → class metadata → NSString block tagged 0x2b ("+") followed
-// by a length byte (1 byte direct 0x01-0x7f, or 0x81+u16le, or 0x82+u32le) then UTF-8 bytes.
+// Format ref: streamtyped header → class metadata → NSString block. After NSString, the inline
+// string payload starts at the 0x2b ("+") tag. Length is variable-width per typedstream:
+//   value < 0x80              → length is the byte itself (direct, 0..127)
+//   0x81 + u8                 → 128..255
+//   0x82 + u16le              → 256..65535
+//   0x83 + u24le              → 65536..16M
 function decodeAttributedBody(hex) {
   if (!hex) return "";
   try {
     const buf = Buffer.from(hex, "hex");
     const nss = buf.indexOf("NSString");
     if (nss < 0) return "";
-    const stop = buf.indexOf("NSDictionary", nss);
-    const region = buf.slice(nss + "NSString".length, stop > 0 ? stop : buf.length);
-    for (let i = 0; i < region.length - 2; i++) {
-      if (region[i] !== 0x2b) continue;
-      let len = region[i + 1];
-      let start = i + 2;
-      if (len === 0x81 && i + 3 < region.length) {
-        len = region.readUInt16LE(i + 2);
-        start = i + 4;
-      } else if (len === 0x82 && i + 5 < region.length) {
-        len = region.readUInt32LE(i + 2);
-        start = i + 6;
-      }
-      if (len > 0 && len < 100000 && start + len <= region.length) {
-        const text = region.slice(start, start + len).toString("utf8");
-        if (/[\p{L}\p{N}]/u.test(text)) return text;
-      }
+    // Skip class metadata until the '+' tag marking the inline string payload.
+    let i = nss + "NSString".length;
+    while (i < buf.length && buf[i] !== 0x2b) i++;
+    if (i >= buf.length) return "";
+    i++;
+    let len;
+    const b = buf[i++];
+    if (b === 0x81) {
+      if (i >= buf.length) return "";
+      len = buf[i]; i += 1;
+    } else if (b === 0x82) {
+      if (i + 1 >= buf.length) return "";
+      len = buf.readUInt16LE(i); i += 2;
+    } else if (b === 0x83) {
+      if (i + 2 >= buf.length) return "";
+      len = buf.readUIntLE(i, 3); i += 3;
+    } else {
+      len = b;
     }
-    return "";
+    if (len <= 0 || i + len > buf.length) return "";
+    return buf.toString("utf8", i, i + len);
   } catch {
     return "";
   }
